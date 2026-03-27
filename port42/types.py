@@ -2,6 +2,18 @@ from dataclasses import dataclass, field
 import json
 
 
+def _parse_payload(raw) -> dict:
+    """Parse a payload that may be a JSON string, bytes, or already a dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+
 @dataclass
 class Message:
     text: str
@@ -14,9 +26,7 @@ class Message:
 
     @classmethod
     def from_envelope(cls, env: dict) -> "Message":
-        payload = json.loads(env.get("payload", "{}") or "{}")
-        if isinstance(payload, bytes):
-            payload = json.loads(payload)
+        payload = _parse_payload(env.get("payload", "{}"))
         return cls(
             text=payload.get("text", ""),
             sender=env.get("sender_name", ""),
@@ -38,9 +48,7 @@ class Feedback:
 
     @classmethod
     def from_envelope(cls, env: dict) -> "Feedback":
-        payload = json.loads(env.get("payload", "{}") or "{}")
-        if isinstance(payload, bytes):
-            payload = json.loads(payload)
+        payload = _parse_payload(env.get("payload", "{}"))
         return cls(
             message_id=env.get("message_id", ""),
             type=payload.get("feedback_type", ""),

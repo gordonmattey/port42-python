@@ -243,13 +243,11 @@ class Agent:
         del self._pending_calls[call_id]
         if result.get("error"):
             raise RuntimeError(result["error"])
-        payload = result.get("payload", "{}")
-        if isinstance(payload, (bytes, str)):
-            try:
-                return json.loads(payload)
-            except Exception:
-                return {"content": payload}
-        return payload or {}
+        from .types import _parse_payload
+        payload = result.get("payload", {})
+        if isinstance(payload, dict):
+            return payload
+        return _parse_payload(payload)
 
     def port_push(self, port_id: str, data: dict):
         return self._call("port_push", {"id": port_id, "data": data})

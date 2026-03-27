@@ -27,7 +27,7 @@ Port42 must be running. The agent connects via WebSocket and appears in your com
 ## With LangChain
 
 ```bash
-pip install port42[langchain]
+pip install 'port42[langchain]'
 ```
 
 ```python
