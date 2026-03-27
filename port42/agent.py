@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import uuid
+import urllib.parse
 
 from .types import Message, Feedback
 
@@ -11,17 +12,39 @@ class Agent:
     def __init__(
         self,
         name: str,
+        invite: str | None = None,
         channels: list[str] | None = None,
         trigger: str = "mention",
         gateway: str = "ws://127.0.0.1:4242",
         tokens: list[str] | None = None,
     ):
         self.name = name
-        self.channels = channels or []
         self.trigger = trigger
-        self.gateway_url = gateway.rstrip("/") + "/ws"
-        self.http_url = gateway.rstrip("/").replace("ws://", "http://").replace("wss://", "https://")
-        self._channel_tokens: dict[str, str] = dict(zip(channels or [], tokens or []))
+        self._channel_key: str | None = None
+        self._invite_channel_id: str | None = None
+        self._invite_token: str | None = None
+
+        if invite:
+            # Parse port42://channel?gateway=...&id=...&name=...&key=...&token=...
+            parsed = urllib.parse.urlparse(invite)
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            raw_gw = params.get("gateway", gateway)
+            self.gateway_url = raw_gw.rstrip("/") + "/ws"
+            self.http_url = raw_gw.rstrip("/").replace("ws://", "http://").replace("wss://", "https://")
+            self._invite_channel_id = params.get("id")
+            channel_name = params.get("name", "")
+            self.channels = [channel_name] if channel_name else []
+            self._channel_key = params.get("key")
+            self._invite_token = params.get("token")
+            self._channel_tokens: dict[str, str] = {}
+            if self._invite_channel_id and self._invite_token:
+                self._channel_tokens[self._invite_channel_id] = self._invite_token
+        else:
+            self.channels = channels or []
+            self.gateway_url = gateway.rstrip("/") + "/ws"
+            self.http_url = gateway.rstrip("/").replace("ws://", "http://").replace("wss://", "https://")
+            self._channel_tokens = dict(zip(channels or [], tokens or []))
+
         self._channel_ids: list[str] = []
         self._ws = None
         self._handlers: dict[str, list] = {
@@ -104,9 +127,15 @@ class Agent:
         self._save_state()
         print(f"[port42] connected")
 
-        # Resolve channel names → IDs
-        if self.channels and not self._channel_ids:
+        # Resolve channel IDs
+        if self._invite_channel_id:
+            # Invite URL gives us the channel ID directly
+            self._channel_ids = [self._invite_channel_id]
+        elif self.channels and not self._channel_ids:
             self._channel_ids = self._resolve_channels(self.channels)
+
+        if not self._channel_ids:
+            print(f"[port42] warning: no channels joined — could not resolve {self.channels}")
 
         # Join channels
         for ch_id in self._channel_ids:
@@ -115,12 +144,13 @@ class Agent:
             if token:
                 join["token"] = token
             self._ws.send(json.dumps(join))
-            # Drain until presence (joined) or error
             for _ in range(10):
                 resp = json.loads(self._ws.recv())
                 if resp["type"] in ("presence", "error"):
                     if resp["type"] == "error":
                         print(f"[port42] failed to join {ch_id}: {resp.get('error')}")
+                    else:
+                        print(f"[port42] joined channel {ch_id}")
                     break
 
     def _resolve_channels(self, names: list[str]) -> list[str]:
@@ -130,12 +160,13 @@ class Agent:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
-        # result is {"content": "[{...}]"} or direct list
         content = result.get("content", result)
         if isinstance(content, str):
             channels = json.loads(content)
-        else:
+        elif isinstance(content, list):
             channels = content
+        else:
+            channels = []
         name_set = {n.lstrip("#").lower() for n in names}
         ids = [ch["id"] for ch in channels if ch.get("name", "").lower() in name_set]
         if not ids:
@@ -161,17 +192,53 @@ class Agent:
                 self._call_results[call_id] = env
                 self._pending_calls[call_id].set()
             else:
-                threading.Thread(target=self._dispatch, args=(env,), daemon=True).start()
+                def _safe_dispatch(e):
+                    try:
+                        self._dispatch(e)
+                    except Exception as ex:
+                        print(f"[port42] dispatch error: {ex!r}")
+                threading.Thread(target=_safe_dispatch, args=(env,), daemon=True).start()
 
     def _dispatch(self, env: dict):
         msg_type = env.get("type")
 
         if msg_type == "message":
-            # Skip own messages
             if env.get("sender_id") == self.sender_id:
                 return
-            msg = Message.from_envelope(env)
-            is_mention = f"@{self.name.lower()}" in (msg.text or "").lower()
+
+            # Resolve payload: decrypt if needed
+            raw_payload = env.get("payload", {})
+            if isinstance(raw_payload, str):
+                try:
+                    raw_payload = json.loads(raw_payload)
+                except Exception:
+                    raw_payload = {}
+
+            if raw_payload.get("encrypted") and self._channel_key:
+                from .crypto import decrypt
+                decrypted = decrypt(raw_payload.get("content", ""), self._channel_key)
+                if decrypted:
+                    raw_payload = decrypted
+
+            # Support Port42 SyncPayload format (content/senderName) and legacy SDK format (text)
+            text = raw_payload.get("content") or raw_payload.get("text", "")
+            sender_name = raw_payload.get("senderName") or env.get("sender_name", "")
+            sender_id = env.get("sender_id", "")
+
+            if not text or not sender_id:
+                return
+
+            msg = Message(
+                text=text,
+                sender=sender_name,
+                sender_id=sender_id,
+                channel_id=env.get("channel_id", ""),
+                message_id=env.get("message_id", ""),
+                timestamp=env.get("timestamp", 0),
+                history=raw_payload.get("history", []),
+            )
+
+            is_mention = f"@{self.name.lower()}" in msg.text.lower()
             if is_mention:
                 for handler in self._handlers["mention"]:
                     try:
@@ -203,13 +270,33 @@ class Agent:
         ch = channel_id or (self._channel_ids[0] if self._channel_ids else None)
         if not ch:
             raise RuntimeError("No channel to send to — specify channel_id or join a channel first")
+
+        # Build SyncPayload-compatible payload
+        clear_payload = {
+            "senderName": self.name,
+            "senderType": "agent",
+            "content": text,
+        }
+
+        if self._channel_key:
+            from .crypto import encrypt
+            blob = encrypt(clear_payload, self._channel_key)
+            wire_payload = {
+                "senderName": "",
+                "senderType": "agent",
+                "content": blob,
+                "encrypted": True,
+            }
+        else:
+            wire_payload = clear_payload
+
         env = {
             "type": "message",
             "channel_id": ch,
             "sender_id": self.sender_id,
             "sender_name": self.name,
             "message_id": f"agent-{uuid.uuid4().hex[:16]}",
-            "payload": json.dumps({"text": text}),
+            "payload": wire_payload,
         }
         self._ws.send(json.dumps(env))
 

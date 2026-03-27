@@ -9,8 +9,10 @@ def _parse_payload(raw) -> dict:
     if isinstance(raw, (str, bytes, bytearray)):
         try:
             return json.loads(raw)
-        except Exception:
+        except Exception as e:
+            print(f"[port42] payload parse error: {e!r} raw={repr(raw)[:80]}")
             return {}
+    print(f"[port42] unexpected payload type: {type(raw)} value={raw!r}")
     return {}
 
 
