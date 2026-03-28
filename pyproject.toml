@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "port42"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python SDK for Port42 — connect external agents to your macOS companion"
 readme = "README.md"
 requires-python = ">=3.10"

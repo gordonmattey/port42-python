@@ -308,6 +308,7 @@ class Agent:
             "type": "typing",
             "channel_id": ch,
             "sender_id": self.sender_id,
+            "payload": {"senderName": self.name, "senderType": "agent", "content": "typing"},
         }))
 
     # --- Bridge API ---
