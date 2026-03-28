@@ -211,6 +211,104 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
             raise click.ClickException(f"No reply within {timeout}s")
 
 
+@main.command()
+@click.option("--channel", "-c", default=None, help="Channel name or ID")
+@click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
+@click.option("--name", "-n", default="Claude Code", help="Sender name shown in channel")
+@click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
+@click.option("--live", is_flag=True, default=False, help="Live mode: stream stdin line-by-line (vs pipe: send all at once)")
+@click.option("--batch-ms", default=200, help="Live mode: ms to wait before flushing buffered lines (default: 200)")
+def bridge(channel: str | None, gateway: str, name: str, owner: str | None, live: bool, batch_ms: int):
+    """Bridge terminal output to a Port42 channel.
+
+    Pipe mode (default): reads all stdin and sends as one message.
+      example: my-script | port42 bridge -c "#ops"
+
+    Live mode (--live): streams stdin line-by-line, batching rapid output.
+      example: port42 bridge -c "#ops" --live  (then type or pipe to it)
+    """
+    import sys
+    import threading
+    import time
+    import uuid
+    from websockets.sync.client import connect as ws_connect
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
+    sender_id = f"cli-{uuid.uuid4().hex[:12]}"
+
+    ch_id = None
+    if channel:
+        ch_id = _resolve_channel(channel, http_url)
+        if not ch_id:
+            raise click.ClickException(f"Channel not found: {channel}")
+
+    def make_payload(text: str) -> dict:
+        p: dict = {"senderName": name, "senderType": "agent", "content": text}
+        if owner:
+            p["senderOwner"] = owner
+        return p
+
+    def send_msg(ws, text: str):
+        if not text.strip():
+            return
+        ws.send(json.dumps({
+            "type": "message",
+            "channel_id": ch_id,
+            "sender_id": sender_id,
+            "sender_name": name,
+            "message_id": f"cli-{uuid.uuid4().hex[:16]}",
+            "payload": make_payload(text),
+        }))
+
+    with ws_connect(ws_url) as ws:
+        msg = json.loads(ws.recv())
+        if msg.get("type") == "challenge":
+            raise click.ClickException("Remote auth not supported in CLI mode")
+        ws.send(json.dumps({"type": "identify", "sender_id": sender_id, "sender_name": name}))
+        ws.recv()  # welcome
+        if ch_id:
+            ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
+            for _ in range(10):
+                resp = json.loads(ws.recv())
+                if resp.get("type") == "presence":
+                    break
+
+        if not live:
+            # Pipe mode: read all stdin, send as one message
+            content = sys.stdin.read()
+            send_msg(ws, content)
+            click.echo("sent", err=True)
+        else:
+            # Live mode: stream stdin line-by-line with batching
+            click.echo(f"bridging stdin → #{channel or 'current'} (ctrl+c to stop)", err=True)
+            buf: list[str] = []
+            lock = threading.Lock()
+
+            def flush():
+                with lock:
+                    if buf:
+                        send_msg(ws, "\n".join(buf))
+                        buf.clear()
+
+            def flush_loop():
+                while True:
+                    time.sleep(batch_ms / 1000)
+                    flush()
+
+            threading.Thread(target=flush_loop, daemon=True).start()
+
+            try:
+                for line in sys.stdin:
+                    with lock:
+                        buf.append(line.rstrip())
+            except KeyboardInterrupt:
+                pass
+            finally:
+                flush()
+            click.echo("bridge closed", err=True)
+
+
 def _call(gateway: str, method: str, args: dict) -> dict:
     http = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
     data = json.dumps({"method": method, "args": args}).encode()
