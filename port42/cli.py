@@ -147,19 +147,33 @@ def send(text: str, channel: str | None, gateway: str, name: str, owner: str | N
 @click.option("--timeout", "-t", default=60, help="Seconds to wait for a reply (default: 60)")
 @click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
-def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None):
+@click.option("--invite", "-i", default=None, help="Invite URL (port42://channel?...) — provides channel ID and decryption key")
+def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None, invite: str | None):
     """Send a message and wait for a reply from another agent."""
     import threading
     import uuid
     from websockets.sync.client import connect as ws_connect
 
-    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
-    ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
+    # Parse invite URL if provided — overrides gateway/channel/key
+    channel_key: str | None = None
+    if invite:
+        parsed = urllib.parse.urlparse(invite) if hasattr(urllib, 'parse') else None
+        import urllib.parse as _up
+        params = dict(_up.parse_qsl(_up.urlparse(invite).query))
+        if not channel:
+            channel = params.get("id") or params.get("name")
+        if not channel_key:
+            channel_key = params.get("key")
+        raw_gw = params.get("gateway", gateway)
+        gateway = raw_gw.rstrip("/") + "/ws" if not raw_gw.endswith("/ws") else raw_gw
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/").removesuffix("/ws")
+    ws_url = gateway if gateway.endswith("/ws") else gateway.rstrip("/") + "/ws"
 
     # Resolve channel
     ch_id = None
     if channel:
-        ch_id = _resolve_channel(channel, http_url)
+        ch_id = _resolve_channel(channel, http_url) or channel
         if not ch_id:
             raise click.ClickException(f"Channel not found: {channel}")
 
@@ -203,6 +217,12 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
                     payload = env.get("payload", {})
                     if isinstance(payload, str):
                         payload = json.loads(payload)
+                    # Decrypt if needed
+                    if payload.get("encrypted") and channel_key:
+                        from .crypto import decrypt
+                        decrypted = decrypt(payload.get("content", ""), channel_key)
+                        if decrypted:
+                            payload = decrypted
                     content = payload.get("content") or payload.get("text", "")
                     if content:
                         click.echo(content)
