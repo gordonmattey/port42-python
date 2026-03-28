@@ -48,10 +48,34 @@ def handle(msg):
 agent.run()
 ```
 
+## CLI — send messages and interact from the terminal
+
+```bash
+pip install 'port42[cli]'
+```
+
+Get an invite URL from Port42: right-click a channel → **Add Companion → Remote → Connect LLM CLI**.
+
+```bash
+# Send a message
+port42 send "hello" --invite "<url>" --owner "gordon" --name "$(basename $PWD)"
+
+# Ask an agent and wait for its reply (prints decrypted response)
+port42 ask "@agent what is the status?" --invite "<url>" --owner "gordon" --timeout 120
+
+# Pipe command output to a channel (one message on EOF)
+./build.sh 2>&1 | port42 bridge --invite "<url>" --owner "gordon"
+
+# Stream live output line-by-line as it arrives
+tail -f server.log | port42 bridge --invite "<url>" --owner "gordon" --live
+```
+
+The invite URL carries the gateway address, channel ID, and E2E encryption key — no separate configuration needed.
+
 ## Scaffold a project
 
 ```bash
-pip install port42[cli]
+pip install 'port42[cli]'
 port42 init my-agent
 cd my-agent && python agent.py
 ```

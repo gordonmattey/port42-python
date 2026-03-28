@@ -66,14 +66,38 @@ agent.run()
 
 @click.group()
 def main():
+    """Port42 CLI — connect agents and scripts to your Port42 channels.
+
+    \b
+    Quick start:
+      port42 init my-agent            # scaffold a new agent project
+      port42 send "hello"             # send to current channel (localhost)
+      port42 send "hello" --invite <url>  # send to a remote channel via invite URL
+      port42 ask "@agent question" --invite <url>  # send and wait for reply
+
+    \b
+    Get an invite URL from Port42: right-click a channel → "Create Invitation Link".
+    """
     pass
 
 
 @main.command()
 @click.argument("name")
-@click.option("--template", default="basic", help="Template: basic, langchain, pipeline")
+@click.option("--template", default="basic", type=click.Choice(["basic", "langchain", "pipeline"]), help="Scaffold template (default: basic)")
 def init(name: str, template: str):
-    """Create a new Port42 agent project."""
+    """Scaffold a new Port42 agent project.
+
+    \b
+    Templates:
+      basic      — simple on_mention handler
+      langchain  — LangChain chain with Port42CallbackHandler (typing indicator)
+      pipeline   — pipeline skeleton with port creation example
+
+    \b
+    Example:
+      port42 init my-agent
+      port42 init my-agent --template langchain
+    """
     os.makedirs(name, exist_ok=True)
 
     templates = {
@@ -98,10 +122,36 @@ def init(name: str, template: str):
 @click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway URL")
 @click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner (e.g. 'gordon', 'port42-native')")
-def send(text: str, channel: str | None, gateway: str, name: str, owner: str | None):
-    """Send a message to a Port42 channel."""
+@click.option("--invite", "-i", default=None, help="Invite URL (port42:// or https://port42.ai/invite.html?...) — sets gateway, channel, and E2E encryption key")
+def send(text: str, channel: str | None, gateway: str, name: str, owner: str | None, invite: str | None):
+    """Send a message to a Port42 channel.
+
+    \b
+    With --invite, the URL provides the gateway, channel ID, and encryption key —
+    no separate configuration needed. Messages are E2E encrypted automatically.
+
+    \b
+    Examples:
+      port42 send "hello"                              # localhost, current channel
+      port42 send "hello" -c "#ops"                   # localhost, named channel
+      port42 send "hello" --invite "<url>"            # remote channel via invite URL
+      port42 send "hello" --invite "<url>" --owner gordon  # shown as "Claude Code@gordon"
+    """
     import uuid
+    import urllib.parse as _up
     from websockets.sync.client import connect as ws_connect
+
+    channel_key: str | None = None
+    join_token: str | None = None
+    if invite:
+        params = dict(_up.parse_qsl(_up.urlparse(invite).query))
+        if not channel:
+            channel = params.get("id") or params.get("name")
+        gw = params.get("gateway", "").rstrip("/")
+        if gw:
+            gateway = gw
+        channel_key = params.get("key")
+        join_token = params.get("token")
 
     http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
     ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
@@ -110,15 +160,16 @@ def send(text: str, channel: str | None, gateway: str, name: str, owner: str | N
 
     ch_id = None
     if channel:
-        ch_id = _resolve_channel(channel, http_url)
-        if not ch_id:
-            raise click.ClickException(f"Channel not found: {channel}")
+        ch_id = _resolve_channel(channel, http_url) or channel
 
     with ws_connect(ws_url) as ws:
         msg = json.loads(ws.recv())
         if msg.get("type") == "challenge":
             raise click.ClickException("Remote auth not supported in CLI mode")
-        ws.send(json.dumps({"type": "identify", "sender_id": sender_id, "sender_name": sender_name}))
+        identify: dict = {"type": "identify", "sender_id": sender_id, "sender_name": sender_name}
+        if join_token:
+            identify["token"] = join_token
+        ws.send(json.dumps(identify))
         ws.recv()  # welcome
         if ch_id:
             ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
@@ -129,6 +180,10 @@ def send(text: str, channel: str | None, gateway: str, name: str, owner: str | N
         payload: dict = {"senderName": sender_name, "senderType": "agent", "content": text}
         if owner:
             payload["senderOwner"] = owner
+        if channel_key:
+            from port42.crypto import encrypt
+            encrypted_blob = encrypt(payload, channel_key)
+            payload = {"senderName": "", "senderType": "agent", "encrypted": True, "content": encrypted_blob}
         ws.send(json.dumps({
             "type": "message",
             "channel_id": ch_id,
@@ -147,9 +202,23 @@ def send(text: str, channel: str | None, gateway: str, name: str, owner: str | N
 @click.option("--timeout", "-t", default=60, help="Seconds to wait for a reply (default: 60)")
 @click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
-@click.option("--invite", "-i", default=None, help="Invite URL (port42://channel?...) — provides channel ID and decryption key")
+@click.option("--invite", "-i", default=None, help="Invite URL (port42:// or https://port42.ai/invite.html?...) — sets gateway, channel, and E2E decryption key")
 def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None, invite: str | None):
-    """Send a message and wait for a reply from another agent."""
+    """Send a message and wait for a reply from an agent.
+
+    \b
+    Sends TEXT to the channel, then blocks until another sender replies (or timeout).
+    The reply is printed to stdout — useful for scripting and LLM tool use.
+
+    \b
+    With --invite, replies are decrypted automatically using the key in the URL.
+
+    \b
+    Examples:
+      port42 ask "@synth summarise today"
+      port42 ask "@agent what is the build status?" --timeout 120
+      port42 ask "@agent run report" --invite "<url>" --owner gordon
+    """
     import threading
     import uuid
     from websockets.sync.client import connect as ws_connect
@@ -199,6 +268,9 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
         payload: dict = {"senderName": name, "senderType": "agent", "content": text}
         if owner:
             payload["senderOwner"] = owner
+        if channel_key:
+            from port42.crypto import encrypt
+            payload = {"senderName": "", "senderType": "agent", "encrypted": True, "content": encrypt(payload, channel_key)}
         ws.send(json.dumps({
             "type": "message",
             "channel_id": ch_id,
@@ -236,22 +308,41 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
 @click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
 @click.option("--name", "-n", default="Claude Code", help="Sender name shown in channel")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
-@click.option("--live", is_flag=True, default=False, help="Live mode: stream stdin line-by-line (vs pipe: send all at once)")
-@click.option("--batch-ms", default=200, help="Live mode: ms to wait before flushing buffered lines (default: 200)")
-def bridge(channel: str | None, gateway: str, name: str, owner: str | None, live: bool, batch_ms: int):
+@click.option("--invite", "-i", default=None, help="Invite URL — provides gateway, channel ID, and encryption key")
+@click.option("--live", is_flag=True, default=False, help="Stream stdin line-by-line as it arrives (default: wait for EOF and send as one message)")
+@click.option("--batch-ms", default=200, help="Live mode: flush interval in ms for batching rapid lines (default: 200)")
+def bridge(channel: str | None, gateway: str, name: str, owner: str | None, invite: str | None, live: bool, batch_ms: int):
     """Bridge terminal output to a Port42 channel.
 
-    Pipe mode (default): reads all stdin and sends as one message.
-      example: my-script | port42 bridge -c "#ops"
+    \b
+    Pipe mode (default): reads all stdin to EOF and sends as a single message.
+      make build 2>&1 | port42 bridge -c "#ops"
+      cat report.txt  | port42 bridge -c "#ops" --owner gordon
 
-    Live mode (--live): streams stdin line-by-line, batching rapid output.
-      example: port42 bridge -c "#ops" --live  (then type or pipe to it)
+    \b
+    Live mode (--live): streams stdin line-by-line, flushing every --batch-ms.
+    Useful for long-running processes where you want updates as they arrive.
+      tail -f server.log | port42 bridge -c "#ops" --live
+      pytest -v         | port42 bridge -c "#ops" --live --batch-ms 500
     """
     import sys
     import threading
     import time
     import uuid
+    import urllib.parse as _up
     from websockets.sync.client import connect as ws_connect
+
+    channel_key: str | None = None
+    join_token: str | None = None
+    if invite:
+        params = dict(_up.parse_qsl(_up.urlparse(invite).query))
+        if not channel:
+            channel = params.get("id") or params.get("name")
+        gw = params.get("gateway", "").rstrip("/")
+        if gw:
+            gateway = gw
+        channel_key = params.get("key")
+        join_token = params.get("token")
 
     http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
     ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
@@ -259,14 +350,15 @@ def bridge(channel: str | None, gateway: str, name: str, owner: str | None, live
 
     ch_id = None
     if channel:
-        ch_id = _resolve_channel(channel, http_url)
-        if not ch_id:
-            raise click.ClickException(f"Channel not found: {channel}")
+        ch_id = _resolve_channel(channel, http_url) or channel
 
     def make_payload(text: str) -> dict:
         p: dict = {"senderName": name, "senderType": "agent", "content": text}
         if owner:
             p["senderOwner"] = owner
+        if channel_key:
+            from port42.crypto import encrypt
+            return {"senderName": "", "senderType": "agent", "encrypted": True, "content": encrypt(p, channel_key)}
         return p
 
     def send_msg(ws, text: str):
@@ -285,7 +377,10 @@ def bridge(channel: str | None, gateway: str, name: str, owner: str | None, live
         msg = json.loads(ws.recv())
         if msg.get("type") == "challenge":
             raise click.ClickException("Remote auth not supported in CLI mode")
-        ws.send(json.dumps({"type": "identify", "sender_id": sender_id, "sender_name": name}))
+        identify: dict = {"type": "identify", "sender_id": sender_id, "sender_name": name}
+        if join_token:
+            identify["token"] = join_token
+        ws.send(json.dumps(identify))
         ws.recv()  # welcome
         if ch_id:
             ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
