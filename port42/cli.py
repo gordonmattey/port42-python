@@ -3,7 +3,9 @@ try:
 except ImportError:
     raise ImportError("click is required: pip install port42[cli]")
 
+import json
 import os
+import urllib.request
 
 
 BASIC_TEMPLATE = '''from port42 import Agent
@@ -88,3 +90,150 @@ def init(name: str, template: str):
 
     click.echo(f"Created {name}/agent.py")
     click.echo(f"Run with: cd {name} && python agent.py")
+
+
+@main.command()
+@click.argument("text")
+@click.option("--channel", "-c", default=None, help="Channel name or ID (default: current channel)")
+@click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway URL")
+@click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
+@click.option("--owner", "-o", default=None, help="Owner context shown as name@owner (e.g. 'gordon', 'port42-native')")
+def send(text: str, channel: str | None, gateway: str, name: str, owner: str | None):
+    """Send a message to a Port42 channel."""
+    import uuid
+    from websockets.sync.client import connect as ws_connect
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
+    sender_name = name
+    sender_id = f"cli-{uuid.uuid4().hex[:12]}"
+
+    ch_id = None
+    if channel:
+        ch_id = _resolve_channel(channel, http_url)
+        if not ch_id:
+            raise click.ClickException(f"Channel not found: {channel}")
+
+    with ws_connect(ws_url) as ws:
+        msg = json.loads(ws.recv())
+        if msg.get("type") == "challenge":
+            raise click.ClickException("Remote auth not supported in CLI mode")
+        ws.send(json.dumps({"type": "identify", "sender_id": sender_id, "sender_name": sender_name}))
+        ws.recv()  # welcome
+        if ch_id:
+            ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
+            for _ in range(10):
+                resp = json.loads(ws.recv())
+                if resp.get("type") == "presence":
+                    break
+        payload: dict = {"senderName": sender_name, "senderType": "agent", "content": text}
+        if owner:
+            payload["senderOwner"] = owner
+        ws.send(json.dumps({
+            "type": "message",
+            "channel_id": ch_id,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "message_id": f"cli-{uuid.uuid4().hex[:16]}",
+            "payload": payload,
+        }))
+    click.echo("sent")
+
+
+@main.command("send-and-wait")
+@click.argument("text")
+@click.option("--channel", "-c", default=None, help="Channel name or ID (default: current channel)")
+@click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
+@click.option("--timeout", "-t", default=60, help="Seconds to wait for a reply (default: 60)")
+@click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
+@click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
+def send_and_wait(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None):
+    """Send a message and wait for a reply from another agent."""
+    import threading
+    import uuid
+    from websockets.sync.client import connect as ws_connect
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
+
+    # Resolve channel
+    ch_id = None
+    if channel:
+        ch_id = _resolve_channel(channel, http_url)
+        if not ch_id:
+            raise click.ClickException(f"Channel not found: {channel}")
+
+    sender_id = f"cli-{uuid.uuid4().hex[:12]}"
+
+    with ws_connect(ws_url) as ws:
+        # Identify
+        msg = json.loads(ws.recv())
+        if msg.get("type") == "challenge":
+            raise click.ClickException("Remote auth not supported in CLI mode")
+        ws.send(json.dumps({"type": "identify", "sender_id": sender_id, "sender_name": name}))
+        ws.recv()  # welcome
+
+        # Join channel
+        if ch_id:
+            ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
+            for _ in range(10):
+                resp = json.loads(ws.recv())
+                if resp.get("type") == "presence":
+                    break
+
+        # Send
+        payload: dict = {"senderName": name, "senderType": "agent", "content": text}
+        if owner:
+            payload["senderOwner"] = owner
+        ws.send(json.dumps({
+            "type": "message",
+            "channel_id": ch_id,
+            "sender_id": sender_id,
+            "sender_name": name,
+            "message_id": f"cli-{uuid.uuid4().hex[:16]}",
+            "payload": payload,
+        }))
+
+        # Wait for reply from a different sender
+        ws.settimeout(timeout)
+        try:
+            while True:
+                raw = ws.recv()
+                env = json.loads(raw)
+                if env.get("type") == "message" and env.get("sender_id") != sender_id:
+                    payload = env.get("payload", {})
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    content = payload.get("content") or payload.get("text", "")
+                    if content:
+                        click.echo(content)
+                        break
+        except Exception:
+            raise click.ClickException(f"No reply within {timeout}s")
+
+
+def _call(gateway: str, method: str, args: dict) -> dict:
+    http = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    data = json.dumps({"method": method, "args": args}).encode()
+    req = urllib.request.Request(
+        http + "/call", data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read())
+    content = result.get("content", result)
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except Exception:
+            return {"ok": True}
+    return content if isinstance(content, dict) else {"ok": True}
+
+
+def _resolve_channel(name: str, gateway: str) -> str | None:
+    channels = _call(gateway, "channel.list", {})
+    if isinstance(channels, list):
+        clean = name.lstrip("#").lower()
+        for ch in channels:
+            if ch.get("name", "").lower() == clean or ch.get("id") == name:
+                return ch["id"]
+    return None
