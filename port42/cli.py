@@ -140,14 +140,14 @@ def send(text: str, channel: str | None, gateway: str, name: str, owner: str | N
     click.echo("sent")
 
 
-@main.command("send-and-wait")
+@main.command("ask")
 @click.argument("text")
 @click.option("--channel", "-c", default=None, help="Channel name or ID (default: current channel)")
 @click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
 @click.option("--timeout", "-t", default=60, help="Seconds to wait for a reply (default: 60)")
 @click.option("--name", "-n", default="Claude Code", help="AI or tool name (e.g. 'Claude Code', 'Gemini')")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
-def send_and_wait(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None):
+def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, owner: str | None):
     """Send a message and wait for a reply from another agent."""
     import threading
     import uuid
@@ -195,10 +195,9 @@ def send_and_wait(text: str, channel: str | None, gateway: str, timeout: int, na
         }))
 
         # Wait for reply from a different sender
-        ws.settimeout(timeout)
         try:
             while True:
-                raw = ws.recv()
+                raw = ws.recv(timeout=timeout)
                 env = json.loads(raw)
                 if env.get("type") == "message" and env.get("sender_id") != sender_id:
                     payload = env.get("payload", {})
