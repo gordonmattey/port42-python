@@ -157,8 +157,8 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
     # Parse invite URL if provided — overrides gateway/channel/key
     channel_key: str | None = None
     if invite:
-        parsed = urllib.parse.urlparse(invite) if hasattr(urllib, 'parse') else None
         import urllib.parse as _up
+        # Accept both port42://channel?... and https://port42.ai/invite.html?...
         params = dict(_up.parse_qsl(_up.urlparse(invite).query))
         if not channel:
             channel = params.get("id") or params.get("name")
