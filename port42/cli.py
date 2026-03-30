@@ -306,6 +306,116 @@ def ask(text: str, channel: str | None, gateway: str, timeout: int, name: str, o
 @main.command()
 @click.option("--channel", "-c", default=None, help="Channel name or ID")
 @click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
+@click.option("--name", "-n", default="Claude Code", help="Your agent name in the channel")
+@click.option("--invite", "-i", default=None, help="Invite URL — provides gateway, channel ID, and encryption key")
+@click.option("--mentions-only", is_flag=True, default=False, help="Only print messages that @mention your name")
+def listen(channel: str | None, gateway: str, name: str, invite: str | None, mentions_only: bool):
+    """Listen for messages in a channel and print them as NDJSON.
+
+    \b
+    Connects via WebSocket, joins the channel, and streams incoming messages to
+    stdout as newline-delimited JSON. Each line is one message. Use this as the
+    input to a resident agent loop.
+
+    \b
+    Examples:
+      port42 listen --invite "<url>" --name "scout"
+      port42 listen --invite "<url>" --name "scout" --mentions-only
+      port42 listen --invite "<url>" --name "scout" | python my_agent.py
+    """
+    import sys
+    import uuid
+    import urllib.parse as _up
+    from websockets.sync.client import connect as ws_connect
+
+    channel_key: str | None = None
+    join_token: str | None = None
+    if invite:
+        params = dict(_up.parse_qsl(_up.urlparse(invite).query))
+        if not channel:
+            channel = params.get("id") or params.get("name")
+        gw = params.get("gateway", "").rstrip("/")
+        if gw:
+            gateway = gw
+        channel_key = params.get("key")
+        join_token = params.get("token")
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+    ws_url = gateway.rstrip("/") + "/ws" if not gateway.endswith("/ws") else gateway
+    sender_id = f"cli-{uuid.uuid4().hex[:12]}"
+
+    ch_id = None
+    if channel:
+        ch_id = _resolve_channel(channel, http_url) or channel
+
+    click.echo(f"[port42] listening as {name} in {channel or 'current channel'} (ctrl+c to stop)", err=True)
+
+    with ws_connect(ws_url) as ws:
+        msg = json.loads(ws.recv())
+        if msg.get("type") == "challenge":
+            raise click.ClickException("Remote auth not supported in CLI mode")
+        identify: dict = {"type": "identify", "sender_id": sender_id, "sender_name": name}
+        if join_token:
+            identify["token"] = join_token
+        ws.send(json.dumps(identify))
+        ws.recv()  # welcome
+
+        if ch_id:
+            ws.send(json.dumps({"type": "join", "channel_id": ch_id}))
+            for _ in range(10):
+                resp = json.loads(ws.recv())
+                if resp.get("type") == "presence":
+                    click.echo(f"[port42] joined, {len(resp.get('online_ids', []))} members online", err=True)
+                    break
+
+        try:
+            while True:
+                raw = ws.recv()
+                env = json.loads(raw)
+                if env.get("type") != "message":
+                    continue
+                if env.get("sender_id") == sender_id:
+                    continue
+
+                raw_payload = env.get("payload", {})
+                if isinstance(raw_payload, str):
+                    try:
+                        raw_payload = json.loads(raw_payload)
+                    except Exception:
+                        continue
+
+                if raw_payload.get("encrypted") and channel_key:
+                    from port42.crypto import decrypt
+                    decrypted = decrypt(raw_payload.get("content", ""), channel_key)
+                    if decrypted:
+                        raw_payload = decrypted
+
+                text = raw_payload.get("content") or raw_payload.get("text", "")
+                sender_name = raw_payload.get("senderName") or env.get("sender_name", "")
+
+                if not text:
+                    continue
+
+                is_mention = f"@{name.lower()}" in text.lower()
+                if mentions_only and not is_mention:
+                    continue
+
+                out = {
+                    "sender": sender_name,
+                    "text": text,
+                    "channel_id": env.get("channel_id", ch_id),
+                    "message_id": env.get("message_id", ""),
+                    "mention": is_mention,
+                }
+                sys.stdout.write(json.dumps(out) + "\n")
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            click.echo("[port42] disconnected", err=True)
+
+
+@main.command()
+@click.option("--channel", "-c", default=None, help="Channel name or ID")
+@click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway WebSocket URL")
 @click.option("--name", "-n", default="Claude Code", help="Sender name shown in channel")
 @click.option("--owner", "-o", default=None, help="Owner context shown as name@owner")
 @click.option("--invite", "-i", default=None, help="Invite URL — provides gateway, channel ID, and encryption key")
@@ -439,6 +549,84 @@ def _call(gateway: str, method: str, args: dict) -> dict:
         except Exception:
             return {"ok": True}
     return content if isinstance(content, dict) else {"ok": True}
+
+
+@main.command()
+@click.option("--channel", "-c", default=None, help="Channel name or ID")
+@click.option("--gateway", "-g", default="ws://127.0.0.1:4242", help="Gateway URL")
+@click.option("--invite", "-i", default=None, help="Invite URL — provides gateway, channel ID, and encryption key")
+@click.option("--count", "-n", default=20, help="Number of messages to fetch (default: 20)")
+@click.option("--since", default=None, help="Only show messages after this ISO timestamp or message ID")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as NDJSON (one message per line)")
+def recent(channel: str | None, gateway: str, invite: str | None, count: int, since: str | None, as_json: bool):
+    """Read recent messages from a channel.
+
+    \b
+    Prints messages without sending anything — use this to check for replies.
+
+    \b
+    Examples:
+      port42 recent --invite "<url>"
+      port42 recent --invite "<url>" --since "2026-03-29T12:00:00Z"
+      port42 recent --invite "<url>" --json
+    """
+    import urllib.parse as _up
+
+    channel_key: str | None = None
+    if invite:
+        params = dict(_up.parse_qsl(_up.urlparse(invite).query))
+        if not channel:
+            channel = params.get("id") or params.get("name")
+        gw = params.get("gateway", "").rstrip("/")
+        if gw:
+            gateway = gw
+        channel_key = params.get("key")
+
+    http_url = gateway.replace("ws://", "http://").replace("wss://", "https://").rstrip("/")
+
+    ch_id = None
+    if channel:
+        ch_id = _resolve_channel(channel, http_url) or channel
+
+    if not ch_id:
+        raise click.ClickException("Could not resolve channel — provide --channel or --invite")
+
+    result = _call(http_url, "messages.recent", {"count": count, "channel_id": ch_id})
+    messages = result if isinstance(result, list) else []
+
+    # Decrypt if needed
+    if channel_key:
+        from port42.crypto import decrypt
+        decrypted = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str) and content.startswith("{"):
+                try:
+                    import json as _json
+                    blob = _json.loads(content)
+                    if blob.get("encrypted"):
+                        d = decrypt(blob.get("content", ""), channel_key)
+                        if d:
+                            m = {**m, "content": d.get("content", ""), "sender": d.get("senderName", m.get("sender", ""))}
+                except Exception:
+                    pass
+            decrypted.append(m)
+        messages = decrypted
+
+    # Filter by --since
+    if since:
+        messages = [m for m in messages if str(m.get("timestamp", "")) > since or str(m.get("message_id", "")) > since]
+
+    if as_json:
+        for m in messages:
+            click.echo(json.dumps(m))
+    else:
+        if not messages:
+            click.echo("(no messages)")
+        for m in messages:
+            sender = m.get("sender", "?")
+            content = m.get("content", "")
+            click.echo(f"{sender}: {content}")
 
 
 def _resolve_channel(name: str, gateway: str) -> str | None:
